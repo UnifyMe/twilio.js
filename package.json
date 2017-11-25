@@ -1,0 +1,19 @@
+{
+  "name": "twilio.js",
+  "version": "1.4.25",
+  "main": "lib/twilio.js",
+  "browser": "lib/browser.js",
+  "scripts": {
+    "test": "node -e \"require('.')\""
+  },
+  "devDependencies": {
+    "unbrowserify": "UnifyMe/unbrowserify"
+  },
+  "dependencies": {
+    "inherits": "^2.0.3",
+    "ortc-adapter": "^0.1.7",
+    "sdp-transform": "^2.3.0",
+    "ws": "^3.3.2",
+    "xmlhttprequest": "^1.8.0"
+  }
+}

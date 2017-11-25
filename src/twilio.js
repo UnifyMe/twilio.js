@@ -510,7 +510,7 @@ function replaceStream(audio, stream) {
 
 module.exports = AudioHelper;
 
-},{"./outputdevicecollection":10,"./shims/mediadeviceinfo":22,"./shims/mediadevices":23,"./util":26,"events":33,"util":48}],4:[function(require,module,exports){
+},{"./outputdevicecollection":10,"./shims/mediadeviceinfo":22,"./shims/mediadevices":23,"./util":27,"events":34,"util":49}],4:[function(require,module,exports){
 'use strict';
 
 var EventEmitter = require('events').EventEmitter;
@@ -589,7 +589,7 @@ function Connection(device, message, getUserMedia, options) {
   var self = this;
 
   twutil.monitorEventEmitter('Twilio.Connection', this);
-  this.device = device;
+  this._soundcache = device.soundcache;
   this.message = message || {};
 
   // (rrowland) Lint: This constructor should not be lower case, but if we don't support
@@ -613,6 +613,7 @@ function Connection(device, message, getUserMedia, options) {
 
   this.parameters = options.callParameters;
   this._status = 'pending';
+  this._isAnswered = false;
   this._direction = this.parameters.CallSid ? 'INCOMING' : 'OUTGOING';
 
   this.sendHangup = true;
@@ -624,12 +625,6 @@ function Connection(device, message, getUserMedia, options) {
   function noop() {}
   this._onCancel = noop;
   this._onHangup = noop;
-  this._onAnswer = function(payload) {
-    if (typeof payload.callsid !== 'undefined') {
-      self.parameters.CallSid = payload.callsid;
-      self.mediaStream.callSid = payload.callsid;
-    }
-  };
 
   var publisher = this._publisher = options.publisher;
 
@@ -752,7 +747,7 @@ function Connection(device, message, getUserMedia, options) {
    * Reference to the Twilio.MediaStream object.
    * @type Twilio.MediaStream
    */
-  this.mediaStream = new this.options.MediaStream(this.device, getUserMedia);
+  this.mediaStream = new this.options.MediaStream(device, getUserMedia);
 
   this.on('volume', function(inputVolume, outputVolume) {
     self._latestInputVolume = inputVolume;
@@ -814,10 +809,9 @@ function Connection(device, message, getUserMedia, options) {
     // See <https://code.google.com/p/webrtc/issues/detail?id=4996>.
     if (self._status === 'open') {
       return;
-    } else if (self._status === 'connecting') {
-      self._status = 'open';
+    } else if (self._status === 'ringing' || self._status === 'connecting') {
       self.mute(false);
-      self.emit('accept', self);
+      self._maybeTransitionToOpen();
     } else {
       // call was probably canceled sometime before this
       self.mediaStream.close();
@@ -826,8 +820,8 @@ function Connection(device, message, getUserMedia, options) {
 
   this.mediaStream.onclose = function() {
     self._status = 'closed';
-    if (self.device.sounds.__dict__.disconnect) {
-      self.device.soundcache.get('disconnect').play();
+    if (device.sounds.__dict__.disconnect) {
+      device.soundcache.get('disconnect').play();
     }
 
     monitor.disable();
@@ -839,7 +833,7 @@ function Connection(device, message, getUserMedia, options) {
   // temporary call sid to be used for outgoing calls
   this.outboundConnectionId = twutil.generateConnectionUUID();
 
-  this.pstream = this.device.stream;
+  this.pstream = device.stream;
 
   this._onCancel = function(payload) {
     var callsid = payload.callsid;
@@ -851,8 +845,10 @@ function Connection(device, message, getUserMedia, options) {
   };
 
   // NOTE(mroberts): The test '#sendDigits throws error' sets this to `null`.
-  if (this.pstream)
-    this.pstream.addListener('cancel', this._onCancel);
+  if (this.pstream) {
+    this.pstream.on('cancel', this._onCancel);
+    this.pstream.on('ringing', this._onRinging.bind(this));
+  }
 
   this.on('error', function(error) {
     publisher.error('connection', 'error', {
@@ -906,7 +902,7 @@ Connection.prototype.sendDigits = function(digits) {
     if (sequence.length) {
       setTimeout(playNextDigit.bind(null, soundCache), 200);
     }
-  })(this.device.soundcache);
+  })(this._soundcache);
 
   var dtmfSender = this.mediaStream.getOrCreateDTMFSender();
 
@@ -1033,11 +1029,12 @@ Connection.prototype.accept = function(handler) {
 
     var params = pairs.join('&');
     if (self._direction === 'INCOMING') {
+      self._isAnswered = true;
       self.mediaStream.answerIncomingCall(self.parameters.CallSid, self.options.offerSdp,
         self.options.rtcConstraints, self.options.iceServers, onLocalAnswer);
     } else {
-      self.pstream.once('answer', self._onAnswer);
-      self.mediaStream.makeOutgoingCall(params, self.outboundConnectionId,
+      self.pstream.once('answer', self._onAnswer.bind(self));
+      self.mediaStream.makeOutgoingCall(self.pstream.token, params, self.outboundConnectionId,
         self.options.rtcConstraints, self.options.iceServers, onRemoteAnswer);
     }
 
@@ -1162,7 +1159,7 @@ Connection.prototype.disconnect = function(handler) {
 Connection.prototype._disconnect = function(message, remote) {
   message = typeof message === 'string' ? message : null;
 
-  if (this._status !== 'open' && this._status !== 'connecting') {
+  if (this._status !== 'open' && this._status !== 'connecting' && this._status !== 'ringing') {
     return;
   }
 
@@ -1199,12 +1196,64 @@ Connection.prototype._die = function(message, code) {
   this.emit('error', { message: message, code: code });
 };
 
+Connection.prototype._setCallSid = function _setCallSid(payload) {
+  var callSid = payload.callsid;
+  if (!callSid) { return; }
+
+  this.parameters.CallSid = callSid;
+  this.mediaStream.callSid = callSid;
+};
+
 Connection.prototype._setSinkIds = function _setSinkIds(sinkIds) {
   return this.mediaStream._setSinkIds(sinkIds);
 };
 
 Connection.prototype._setInputTracksFromStream = function _setInputTracksFromStream(stream) {
   return this.mediaStream.setInputTracksFromStream(stream);
+};
+
+/**
+ * When we get a RINGING signal from PStream, update the {@link Connection} status.
+ */
+Connection.prototype._onRinging = function(payload) {
+  this._setCallSid(payload);
+
+  // If we're not in 'connecting' or 'ringing' state, this event was received out of order.
+  if (this._status !== 'connecting' && this._status !== 'ringing') {
+    return;
+  }
+
+  var hasEarlyMedia = !!payload.sdp;
+  if (this.options.enableRingingState) {
+    this._status = 'ringing';
+    this._publisher.info('connection', 'outgoing-ringing', { hasEarlyMedia: hasEarlyMedia }, this);
+    this.emit('ringing', hasEarlyMedia);
+  // answerOnBridge=false will send a 183, which we need to interpret as `answer` when
+  // the enableRingingState flag is disabled in order to maintain a non-breaking API from 1.4.24
+  } else if (hasEarlyMedia) {
+    this._onAnswer(payload);
+  }
+};
+
+Connection.prototype._onAnswer = function(payload) {
+  // answerOnBridge=false will send a 183 which we need to catch in _onRinging when
+  // the enableRingingState flag is disabled. In that case, we will receive a 200 after
+  // the callee accepts the call firing a second `accept` event if we don't
+  // short circuit here.
+  if (this._isAnswered) {
+    return;
+  }
+
+  this._setCallSid(payload);
+  this._isAnswered = true;
+  this._maybeTransitionToOpen();
+};
+
+Connection.prototype._maybeTransitionToOpen = function() {
+  if (this.mediaStream && this.mediaStream.status === 'open' && this._isAnswered) {
+    this._status = 'open';
+    this.emit('accept', this);
+  }
 };
 
 /**
@@ -1292,9 +1341,10 @@ Connection.prototype._getRealCallSid = function() {
 
 function cleanupEventListeners(connection) {
   function cleanup() {
-    connection.pstream.removeListener('answer', connection._onAnswer);
-    connection.pstream.removeListener('cancel', connection._onCancel);
-    connection.pstream.removeListener('hangup', connection._onHangup);
+    if (connection.pstream) {
+      connection.pstream.removeListener('cancel', connection._onCancel);
+      connection.pstream.removeListener('hangup', connection._onHangup);
+    }
   }
   cleanup();
   // This is kind of a hack, but it lets us avoid rewriting more code.
@@ -1314,7 +1364,7 @@ function cleanupEventListeners(connection) {
 
 exports.Connection = Connection;
 
-},{"./log":8,"./rtc":14,"./rtc/monitor":16,"./util":26,"events":33,"util":48}],5:[function(require,module,exports){
+},{"./log":8,"./rtc":14,"./rtc/monitor":16,"./util":27,"events":34,"util":49}],5:[function(require,module,exports){
 'use strict';
 
 var AudioHelper = require('./audiohelper');
@@ -1701,7 +1751,8 @@ function makeConnection(device, params, options) {
     debug: device.options.debug,
     encrypt: device.options.encrypt,
     warnings: device.options.warnings,
-    publisher: device._publisher
+    publisher: device._publisher,
+    enableRingingState: device.options.enableRingingState
   };
 
   options = options || {};
@@ -1873,6 +1924,8 @@ Device.prototype.region = function() {
   return this._region;
 };
 Device.prototype._sendPresence = function() {
+  if (!this.stream) { return; }
+
   this.stream.register(this.mediaPresence);
   if (this.mediaPresence.audio) {
     this._startRegistrationTimer();
@@ -1911,6 +1964,9 @@ Device.prototype._setupStream = function(token) {
     };
     self._region = regions[payload.region] || payload.region;
     self._sendPresence();
+  });
+  this.stream.addListener('close', function() {
+    self.stream = null;
   });
   this.stream.addListener('ready', function() {
     self.log('Stream is ready');
@@ -2243,7 +2299,7 @@ function singletonwrapper(cls) {
 
 exports.Device = singletonwrapper(Device);
 
-},{"./audiohelper":3,"./connection":4,"./eventpublisher":6,"./log":8,"./options":9,"./pstream":11,"./rtc":14,"./rtc/getusermedia":13,"./sound":24,"./util":26,"events":33,"util":48}],6:[function(require,module,exports){
+},{"./audiohelper":3,"./connection":4,"./eventpublisher":6,"./log":8,"./options":9,"./pstream":11,"./rtc":14,"./rtc/getusermedia":13,"./sound":24,"./util":27,"events":34,"util":49}],6:[function(require,module,exports){
 'use strict';
 
 var request = require('./request');
@@ -2719,6 +2775,7 @@ exports.mixinLog = mixinLog;
 'use strict';
 
 var Log = require('./log');
+var SOUNDS_DEPRECATION_WARNING = require('./strings').SOUNDS_DEPRECATION_WARNING;
 
 exports.Options = (function() {
   function Options(defaults, assignments) {
@@ -2729,37 +2786,37 @@ exports.Options = (function() {
     defaults = defaults || {};
     assignments = assignments || {};
     Log.mixinLog(this, '[Sounds]');
+
+    var hasBeenWarned = false;
+    function makeprop(__dict__, name, log) {
+      return function(value, shouldSilence) {
+        if (!shouldSilence && !hasBeenWarned) {
+          hasBeenWarned = true;
+          log.deprecated(SOUNDS_DEPRECATION_WARNING);
+        }
+
+        if (typeof value !== 'undefined') {
+          __dict__[name] = value;
+        }
+
+        return __dict__[name];
+      };
+    }
+
     var name;
     for (name in defaults) {
       this[name] = makeprop(this.__dict__, name, this.log);
-      this[name](defaults[name]);
+      this[name](defaults[name], true);
     }
     for (name in assignments) {
-      this[name](assignments[name]);
+      this[name](assignments[name], true);
     }
   }
 
-  var hasBeenWarned = false;
-  function makeprop(__dict__, name, log) {
-    return function(value) {
-      if (!hasBeenWarned) {
-        hasBeenWarned = true;
-        log.deprecated('Device.sounds is deprecated and ' +
-          'will be removed in the next breaking release. Please use the new ' +
-          'functionality available on Device.audio.');
-      }
-
-      if (typeof value !== 'undefined') {
-        __dict__[name] = value;
-      }
-
-      return __dict__[name];
-    };
-  }
   return Options;
 })();
 
-},{"./log":8}],10:[function(require,module,exports){
+},{"./log":8,"./strings":26}],10:[function(require,module,exports){
 'use strict';
 
 var util = require('./util');
@@ -2895,7 +2952,7 @@ OutputDeviceCollection.prototype.test = function test(soundUrl) {
 
 module.exports = OutputDeviceCollection;
 
-},{"./util":26}],11:[function(require,module,exports){
+},{"./util":27}],11:[function(require,module,exports){
 'use strict';
 
 var EventEmitter = require('events').EventEmitter;
@@ -3009,7 +3066,7 @@ function PStream(token, options) {
       }
 
       if (payload.region) {
-        self.region  = payload.region;
+        self.region = payload.region;
       }
 
       // emit event type and pass the payload
@@ -3064,7 +3121,7 @@ PStream.prototype.publish = function(type, payload) {
 
 exports.PStream = PStream;
 
-},{"./log":8,"./util":26,"./wstransport":27,"events":33,"util":48}],12:[function(require,module,exports){
+},{"./log":8,"./util":27,"./wstransport":28,"events":34,"util":49}],12:[function(require,module,exports){
 'use strict';
 
 var XHR = typeof XMLHttpRequest === 'undefined'
@@ -3126,7 +3183,7 @@ Request.post = function post(params, callback) {
 
 module.exports = Request;
 
-},{"xmlhttprequest":49}],13:[function(require,module,exports){
+},{"xmlhttprequest":50}],13:[function(require,module,exports){
 'use strict';
 
 var util = require('../util');
@@ -3134,7 +3191,8 @@ var util = require('../util');
 function getUserMedia(constraints, options) {
   options = options || {};
   options.util = options.util || util;
-  options.navigator = options.navigator || navigator;
+  options.navigator = options.navigator
+    || (typeof navigator !== 'undefined' ? navigator : null);
 
   return new Promise(function(resolve, reject) {
     if (!options.navigator) {
@@ -3164,7 +3222,7 @@ function getUserMedia(constraints, options) {
 
 module.exports = getUserMedia;
 
-},{"../util":26}],14:[function(require,module,exports){
+},{"../util":27}],14:[function(require,module,exports){
 'use strict';
 
 var PeerConnection = require('./peerconnection');
@@ -4012,7 +4070,7 @@ RTCMonitor.prototype._raiseWarning = function _raiseWarning(statName, thresholdN
 
 module.exports = RTCMonitor;
 
-},{"./mos":17,"./stats":20,"events":33,"util":48}],17:[function(require,module,exports){
+},{"./mos":17,"./stats":20,"events":34,"util":49}],17:[function(require,module,exports){
 'use strict';
 
 var rfactorConstants = {
@@ -4189,7 +4247,6 @@ function PeerConnection(device, getUserMedia, options) {
   this.version = null;
   this.pstream = device.stream;
   this.stream = null;
-  this.device = device;
   this.sinkIds = new Set(['default']);
   this.outputs = new Map();
   this.status = 'connecting';
@@ -4212,23 +4269,23 @@ function PeerConnection(device, getUserMedia, options) {
   this._dtmfSenderUnsupported = false;
   this._callEvents = [];
   this._nextTimeToPublish = Date.now();
-  this._onAnswer = noop;
+  this._onAnswerOrRinging = noop;
   this._remoteStream = null;
   this._shouldStopTracks = true;
   this._shouldManageStream = true;
   Log.mixinLog(this, '[Twilio.PeerConnection]');
-  this.log.enabled = this.device.options.debug;
-  this.log.warnings = this.device.options.warnings;
+  this.log.enabled = device.options.debug;
+  this.log.warnings = device.options.warnings;
 
   this._iceConnectionStateMachine = new StateMachine(ICE_CONNECTION_STATES,
     INITIAL_ICE_CONNECTION_STATE);
   this._signalingStateMachine = new StateMachine(SIGNALING_STATES,
     INITIAL_SIGNALING_STATE);
 
-  options = options || {};
-  this.navigator = options.navigator || navigator;
+  this.options = options = options || {};
+  this.navigator = options.navigator
+    || (typeof navigator !== 'undefined' ? navigator : null);
   this.util = options.util || util;
-  this.window = options.window || window;
 
   return this;
 }
@@ -4695,7 +4752,7 @@ PeerConnection.prototype._initializeMediaStream = function(rtcConstraints, iceSe
   this._setupChannel();
   return true;
 };
-PeerConnection.prototype.makeOutgoingCall = function(params, callsid, rtcConstraints, iceServers, onMediaStarted) {
+PeerConnection.prototype.makeOutgoingCall = function(token, params, callsid, rtcConstraints, iceServers, onMediaStarted) {
   if (!this._initializeMediaStream(rtcConstraints, iceServers)) {
     return;
   }
@@ -4709,13 +4766,18 @@ PeerConnection.prototype.makeOutgoingCall = function(params, callsid, rtcConstra
     var errMsg = err.message || err;
     self.onerror({ info: { code: 31000, message: 'Error processing answer: ' + errMsg } });
   }
-  this._onAnswer = function(payload) {
+  this._onAnswerOrRinging = function(payload) {
+    if (!payload.sdp) { return; }
+
     self._answerSdp = payload.sdp;
     if (self.status !== 'closed') {
       self.version.processAnswer(payload.sdp, onAnswerSuccess, onAnswerError);
     }
+    self.pstream.removeListener('answer', self._onAnswerOrRinging);
+    self.pstream.removeListener('ringing', self._onAnswerOrRinging);
   };
-  this.pstream.once('answer', this._onAnswer);
+  this.pstream.on('answer', this._onAnswerOrRinging);
+  this.pstream.on('ringing', this._onAnswerOrRinging);
 
   function onOfferSuccess() {
     if (self.status !== 'closed') {
@@ -4723,7 +4785,7 @@ PeerConnection.prototype.makeOutgoingCall = function(params, callsid, rtcConstra
         sdp: self.version.getSDP(),
         callsid: self.callSid,
         twilio: {
-          accountsid: self.device.token ? self.util.objectize(self.device.token).iss : null,
+          accountsid: token ? self.util.objectize(token).iss : null,
           params: params
         }
       });
@@ -4773,7 +4835,7 @@ PeerConnection.prototype.close = function() {
   }
   this.stream = null;
   if (this.pstream) {
-    this.pstream.removeListener('answer', this._onAnswer);
+    this.pstream.removeListener('answer', this._onAnswerOrRinging);
   }
   this._removeAudioOutputs();
   if (this._mediaStreamSource) {
@@ -4907,7 +4969,8 @@ function setAudioSource(audio, stream) {
   } else if (typeof audio.mozSrcObject !== 'undefined') {
     audio.mozSrcObject = stream;
   } else if (typeof audio.src !== 'undefined') {
-    audio.src = (window.URL || window.webkitURL).createObjectURL(stream);
+    var _window = audio.options.window || window;
+    audio.src = (_window.URL || _window.webkitURL).createObjectURL(stream);
   } else {
     return false;
   }
@@ -4919,7 +4982,7 @@ PeerConnection.enabled = !!PeerConnection.protocol;
 
 module.exports = PeerConnection;
 
-},{"../log":8,"../statemachine":25,"../util":26,"./rtcpc":19}],19:[function(require,module,exports){
+},{"../log":8,"../statemachine":25,"../util":27,"./rtcpc":19}],19:[function(require,module,exports){
 /* global webkitRTCPeerConnection, mozRTCPeerConnection, mozRTCSessionDescription, mozRTCIceCandidate */
 'use strict';
 
@@ -5089,7 +5152,7 @@ function promisifySet(fn, ctx) {
 
 module.exports = RTCPC;
 
-},{"../util":26,"ortc-adapter":34}],20:[function(require,module,exports){
+},{"../util":27,"ortc-adapter":35}],20:[function(require,module,exports){
 /* eslint-disable no-fallthrough */
 'use strict';
 
@@ -5300,7 +5363,7 @@ EventTarget.prototype._defineEventHandler = function _defineEventHandler(eventNa
 
 module.exports = EventTarget;
 
-},{"events":33}],22:[function(require,module,exports){
+},{"events":34}],22:[function(require,module,exports){
 'use strict';
 
 function MediaDeviceInfoShim(options) {
@@ -5495,7 +5558,7 @@ module.exports = (function shimMediaDevices() {
   return nativeMediaDevices ? new MediaDevicesShim() : null;
 })();
 
-},{"./eventtarget":21,"util":48}],24:[function(require,module,exports){
+},{"./eventtarget":21,"util":49}],24:[function(require,module,exports){
 'use strict';
 
 var AudioPlayer = require('AudioPlayer');
@@ -5680,7 +5743,7 @@ Sound.prototype.play = function play() {
 
 module.exports = Sound;
 
-},{"AudioPlayer":32}],25:[function(require,module,exports){
+},{"AudioPlayer":33}],25:[function(require,module,exports){
 'use strict';
 
 var inherits = require('util').inherits;
@@ -5804,26 +5867,52 @@ inherits(InvalidStateTransition, Error);
 
 module.exports = StateMachine;
 
-},{"util":48}],26:[function(require,module,exports){
+},{"util":49}],26:[function(require,module,exports){
+'use strict';
+
+exports.SOUNDS_DEPRECATION_WARNING =
+  'Device.sounds is deprecated and will be removed in the next breaking ' +
+  'release. Please use the new functionality available on Device.audio.';
+
+/**
+ * Create an EventEmitter warning.
+ * @param {string} event - event name
+ * @param {string} name - EventEmitter name
+ * @param {number} maxListeners - the maximum number of event listeners recommended
+ * @returns {string} warning
+ */
+function generateEventWarning(event, name, maxListeners) {
+  return 'The number of ' + event + ' listeners on ' + name + ' ' +
+    'exceeds the recommended number of ' + maxListeners + '. ' +
+    'While twilio.js will continue to function normally, this ' +
+    'may be indicative of an application error. Note that ' +
+    event + ' listeners exist for the lifetime of the ' +
+    name + '.';
+}
+
+exports.generateEventWarning = generateEventWarning;
+
+},{}],27:[function(require,module,exports){
 /* global Set, base64 */
 /* eslint-disable no-process-env */
 'use strict';
 
 var EventEmitter = require('events').EventEmitter;
+var generateEventWarning = require('./strings').generateEventWarning;
 
 function getPStreamVersion() {
   // NOTE(mroberts): Set by `Makefile'.
-  return "1.3" || '1.0';
+  return "1.4" || '1.0';
 }
 
 function getSDKHash() {
   // NOTE(mroberts): Set by `Makefile'.
-  return "bdb86d2";
+  return "f5264f9";
 }
 
 function getReleaseVersion() {
   // NOTE(jvass): Set by `Makefile`.
-  return "1.4.24";
+  return "1.4.25";
 }
 
 function getSoundVersion() {
@@ -6097,12 +6186,7 @@ function monitorEventEmitter(name, object) {
   var MAX_LISTENERS = 10;
   function monitor(event) {
     var n = EventEmitter.listenerCount(object, event);
-    var warning = 'The number of ' + event + ' listeners on ' + name + ' ' +
-      'exceeds the recommended number of ' + MAX_LISTENERS + '. ' +
-      'While twilio.js will continue to function normally, this ' +
-      'may be indicative of an application error. Note that ' +
-      event + ' listeners exist for the lifetime of the ' +
-      name + '.';
+    var warning = generateEventWarning(event, name, MAX_LISTENERS);
     if (n >= MAX_LISTENERS) {
       /* eslint-disable no-console */
       if (typeof console !== 'undefined') {
@@ -6248,7 +6332,7 @@ exports.difference = difference;
 exports.isFirefox = isFirefox;
 exports.isEdge = isEdge;
 
-},{"events":33}],27:[function(require,module,exports){
+},{"./strings":26,"events":34}],28:[function(require,module,exports){
 'use strict';
 
 var Heartbeat = require('./heartbeat').Heartbeat;
@@ -6470,11 +6554,11 @@ WSTransport.prototype._tryReconnect = function(attempted) {
 
 exports.WSTransport = WSTransport;
 
-},{"./heartbeat":7,"./log":8,"ws":28}],28:[function(require,module,exports){
+},{"./heartbeat":7,"./log":8,"ws":29}],29:[function(require,module,exports){
 'use strict';
 module.exports = WebSocket;
 
-},{}],29:[function(require,module,exports){
+},{}],30:[function(require,module,exports){
 "use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -6735,7 +6819,7 @@ function bufferSound(context, RequestFactory, src) {
     });
 }
 
-},{"./Deferred":30,"./EventTarget":31}],30:[function(require,module,exports){
+},{"./Deferred":31,"./EventTarget":32}],31:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 class Deferred {
@@ -6750,7 +6834,7 @@ class Deferred {
 }
 exports.default = Deferred;
 
-},{}],31:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 const events_1 = require("events");
@@ -6770,12 +6854,12 @@ class EventTarget {
 }
 exports.default = EventTarget;
 
-},{"events":33}],32:[function(require,module,exports){
+},{"events":34}],33:[function(require,module,exports){
 const AudioPlayer = require('./AudioPlayer');
 
 module.exports = AudioPlayer.default;
 
-},{"./AudioPlayer":29}],33:[function(require,module,exports){
+},{"./AudioPlayer":30}],34:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -7079,14 +7163,14 @@ function isUndefined(arg) {
   return arg === void 0;
 }
 
-},{}],34:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 'use strict';
 
 module.exports.RTCIceCandidate = require('./rtcicecandidate');
 module.exports.RTCPeerConnection = require('./rtcpeerconnection');
 module.exports.RTCSessionDescription = require('./rtcsessiondescription');
 
-},{"./rtcicecandidate":37,"./rtcpeerconnection":38,"./rtcsessiondescription":40}],35:[function(require,module,exports){
+},{"./rtcicecandidate":38,"./rtcpeerconnection":39,"./rtcsessiondescription":41}],36:[function(require,module,exports){
 'use strict';
 
 /**
@@ -7317,7 +7401,7 @@ MediaSection.prototype.setTrack = function setTrack(track) {
 
 module.exports = MediaSection;
 
-},{}],36:[function(require,module,exports){
+},{}],37:[function(require,module,exports){
 'use strict';
 
 /**
@@ -7344,7 +7428,7 @@ function MediaStreamEvent(type, init) {
 
 module.exports = MediaStreamEvent;
 
-},{}],37:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 'use strict';
 
 /**
@@ -7373,7 +7457,7 @@ function RTCIceCandidate(candidate) {
 
 module.exports = RTCIceCandidate;
 
-},{}],38:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 'use strict';
 
 var MediaSection = require('./mediasection');
@@ -8316,7 +8400,7 @@ function intersectCodecs(localCodecs, remoteCodecs) {
 
 module.exports = RTCPeerConnection;
 
-},{"./mediasection":35,"./mediastreamevent":36,"./rtcicecandidate":37,"./rtcpeerconnectioniceevent":39,"./rtcsessiondescription":40,"./sdp-utils":41,"sdp-transform":43}],39:[function(require,module,exports){
+},{"./mediasection":36,"./mediastreamevent":37,"./rtcicecandidate":38,"./rtcpeerconnectioniceevent":40,"./rtcsessiondescription":41,"./sdp-utils":42,"sdp-transform":44}],40:[function(require,module,exports){
 'use strict';
 
 /**
@@ -8343,7 +8427,7 @@ function RTCPeerConnectionIceEvent(type, init) {
 
 module.exports = RTCPeerConnectionIceEvent;
 
-},{}],40:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
 'use strict';
 
 /**
@@ -8372,7 +8456,7 @@ function RTCSessionDescription(description) {
 
 module.exports = RTCSessionDescription;
 
-},{}],41:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 'use strict';
 
 var MediaSection = require('./mediasection');
@@ -8895,7 +8979,7 @@ module.exports.addMediaSectionsToSDPBlob = addMediaSectionsToSDPBlob;
 module.exports.makeInitialSDPBlob = makeInitialSDPBlob;
 module.exports.parseDescription = parseDescription;
 
-},{"./mediasection":35,"sdp-transform":43}],42:[function(require,module,exports){
+},{"./mediasection":36,"sdp-transform":44}],43:[function(require,module,exports){
 var grammar = module.exports = {
   v: [{
       name: 'version',
@@ -9176,7 +9260,7 @@ Object.keys(grammar).forEach(function (key) {
   });
 });
 
-},{}],43:[function(require,module,exports){
+},{}],44:[function(require,module,exports){
 var parser = require('./parser');
 var writer = require('./writer');
 
@@ -9186,7 +9270,7 @@ exports.parseFmtpConfig = parser.parseFmtpConfig;
 exports.parsePayloads = parser.parsePayloads;
 exports.parseRemoteCandidates = parser.parseRemoteCandidates;
 
-},{"./parser":44,"./writer":45}],44:[function(require,module,exports){
+},{"./parser":45,"./writer":46}],45:[function(require,module,exports){
 var toIntIfInt = function (v) {
   return String(Number(v)) === v ? Number(v) : v;
 };
@@ -9281,7 +9365,7 @@ exports.parseRemoteCandidates = function (str) {
   return candidates;
 };
 
-},{"./grammar":42}],45:[function(require,module,exports){
+},{"./grammar":43}],46:[function(require,module,exports){
 var grammar = require('./grammar');
 
 // customized util.format - discards excess arguments and can void middle ones
@@ -9397,7 +9481,7 @@ module.exports = function (session, opts) {
   return sdp.join('\r\n') + '\r\n';
 };
 
-},{"./grammar":42}],46:[function(require,module,exports){
+},{"./grammar":43}],47:[function(require,module,exports){
 if (typeof Object.create === 'function') {
   // implementation from standard node.js 'util' module
   module.exports = function inherits(ctor, superCtor) {
@@ -9422,14 +9506,14 @@ if (typeof Object.create === 'function') {
   }
 }
 
-},{}],47:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 module.exports = function isBuffer(arg) {
   return arg && typeof arg === 'object'
     && typeof arg.copy === 'function'
     && typeof arg.fill === 'function'
     && typeof arg.readUInt8 === 'function';
 }
-},{}],48:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -10017,7 +10101,7 @@ function hasOwnProperty(obj, prop) {
   return Object.prototype.hasOwnProperty.call(obj, prop);
 }
 
-},{"./support/isBuffer":47,"inherits":46}],49:[function(require,module,exports){
+},{"./support/isBuffer":48,"inherits":47}],50:[function(require,module,exports){
 exports.XMLHttpRequest = XMLHttpRequest;
 
 },{}]},{},[1]);
