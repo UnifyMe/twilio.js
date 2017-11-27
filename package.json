@@ -14,6 +14,6 @@
     "ortc-adapter": "^0.1.7",
     "sdp-transform": "^2.3.0",
     "ws": "^3.3.2",
-    "xmlhttprequest": "^1.8.0"
+    "xmlhttprequest": "Ohar/node-XMLHttpRequest"
   }
 }
