@@ -1,6 +1,6 @@
 {
   "name": "twilio.js",
-  "version": "1.4.25",
+  "version": "1.4.30",
   "main": "lib/twilio.js",
   "browser": "lib/browser.js",
   "scripts": {
